@@ -1,265 +1,384 @@
-import os
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Any
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
-import json
+from config import MONGO_URI, DEFAULT_WELCOME_MESSAGE
 
+# Configuración del logger
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-class Database:
+class MongoDB:
     def __init__(self):
-        # Configuración de MongoDB
-        self.mongo_uri = os.getenv("MONGODB_URI", "mongodb+srv://zoobot:zoobot@zoolbot.6avd6qf.mongodb.net/zoolbot?retryWrites=true&w=majority&appName=Zoolbot")
-        self.db_name = os.getenv("DB_NAME", "zoolbot")
-        
+        self.client = None
+        self.db = None
+        self.connect()
+        self.init_db()
+
+    def connect(self):
+        """Crea la conexión a MongoDB."""
         try:
-            self.client = MongoClient(self.mongo_uri)
-            self.db = self.client[self.db_name]
-            
-            # Crear colecciones si no existen
-            self.approved_channels = self.db.approved_channels
-            self.pending_submissions = self.db.pending_submissions
-            self.user_stats = self.db.user_stats
-            self.warnings = self.db.warnings
-            self.config = self.db.config
-            self.auto_post_channels = self.db.auto_post_channels
-            self.auto_posts = self.db.auto_posts
-            
-            # Crear índices
-            self.approved_channels.create_index("channel_username", unique=True)
-            self.approved_channels.create_index("added_by")
-            self.approved_channels.create_index("category")
-            self.pending_submissions.create_index("submission_id", unique=True)
-            self.user_stats.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
-            self.warnings.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
-            
-            logger.info("Conexión a MongoDB establecida exitosamente")
-            
-        except Exception as e:
-            logger.error(f"Error conectando a MongoDB: {e}")
+            self.client = MongoClient(MONGO_URI)
+            self.db = self.client.zoolbot  # Changed to match your DB name
+            logger.info("Conexión a MongoDB establecida correctamente")
+        except PyMongoError as e:
+            logger.error(f"Error al conectar con MongoDB: {e}")
             raise
-    
-    async def save_approved_channel(self, channel_id: str, channel_name: str, 
-                                  channel_username: str, category: str, 
-                                  added_by: int, channel_link: str = None) -> bool:
+
+    def init_db(self):
+        """Inicializa las colecciones de la base de datos."""
+        try:
+            # Crear índices necesarios
+            self.db.approved_channels.create_index("channel_id", unique=True)
+            self.db.approved_channels.create_index("channel_username")
+            self.db.approved_channels.create_index("added_by")
+            self.db.approved_channels.create_index("category")
+            
+            self.db.pending_submissions.create_index("submission_id", unique=True)
+            self.db.pending_submissions.create_index("user_id")
+            
+            self.db.warnings.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
+            self.db.stats.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
+            
+            self.db.auto_post_channels.create_index("channel_id", unique=True)
+            
+            # Nuevos índices para las nuevas funcionalidades
+            self.db.user_channels.create_index([("channel_id", 1), ("owner_id", 1)], unique=True)
+            self.db.scheduled_posts.create_index("post_id", unique=True)
+            self.db.post_stats.create_index([("post_id", 1), ("channel_id", 1)], unique=True)
+            
+            # Verificar configuración inicial
+            if not self.db.config.find_one({"key": "welcome_message"}):
+                self.db.config.insert_one({
+                    "key": "welcome_message",
+                    "value": DEFAULT_WELCOME_MESSAGE
+                })
+            
+            if not self.db.config.find_one({"key": "welcome_buttons"}):
+                default_buttons = [
+                    {"text": "Canal Principal", "url": "https://t.me/botoneraMultimediaTv"},
+                    {"text": "Categorías", "url": "https://t.me/c/2259108243/2"},
+                    {"text": "📣 Canales y Grupos 👥", "callback_data": "user_channels"}
+                ]
+                self.db.config.insert_one({
+                    "key": "welcome_buttons",
+                    "value": default_buttons
+                })
+            
+            logger.info("Base de datos inicializada correctamente")
+        except PyMongoError as e:
+            logger.error(f"Error al inicializar la base de datos: {e}")
+            raise
+
+    # ----- FUNCIONES DE CONFIGURACIÓN -----
+    def save_config(self, key, value):
+        """Guarda un valor en la configuración."""
+        try:
+            self.db.config.update_one(
+                {"key": key},
+                {"$set": {"value": value}},
+                upsert=True
+            )
+            return True
+        except PyMongoError as e:
+            logger.error(f"Error guardando configuración {key}: {e}")
+            return False
+
+    def load_config(self, key):
+        """Carga un valor de la configuración."""
+        try:
+            config = self.db.config.find_one({"key": key})
+            return config["value"] if config else None
+        except PyMongoError as e:
+            logger.error(f"Error cargando configuración {key}: {e}")
+            return None
+
+    # ----- FUNCIONES DE CANALES APROBADOS -----
+    def save_approved_channel(self, channel_id, channel_name, channel_username, category, added_by):
         """Guarda un canal aprobado en la base de datos."""
         try:
-            channel_data = {
-                "channel_id": channel_id,
-                "channel_name": channel_name,
-                "channel_username": channel_username,
-                "category": category,
-                "added_by": added_by,
-                "channel_link": channel_link or f"https://t.me/{channel_username}",
-                "added_date": datetime.now(),
-                "subscriber_count": 0,
-                "last_updated": datetime.now()
-            }
-            
-            result = self.approved_channels.insert_one(channel_data)
-            return result.inserted_id is not None
-            
-        except PyMongoError as e:
-            logger.error(f"Error saving approved channel: {e}")
-            return False
-    
-    async def get_approved_channels(self, category: str = None) -> List[Dict]:
-        """Obtiene los canales aprobados, opcionalmente filtrados por categoría."""
-        try:
-            filter_query = {"category": category} if category else {}
-            channels = list(self.approved_channels.find(filter_query).sort("added_date", 1))
-            
-            # Convertir ObjectId a string para serialización
-            for channel in channels:
-                channel["_id"] = str(channel["_id"])
-            
-            return channels
-            
-        except PyMongoError as e:
-            logger.error(f"Error getting approved channels: {e}")
-            return []
-    
-    async def get_user_channels(self, user_id: int) -> List[Dict]:
-        """Obtiene todos los canales añadidos por un usuario específico."""
-        try:
-            channels = list(self.approved_channels.find({"added_by": user_id}).sort("added_date", 1))
-            
-            for channel in channels:
-                channel["_id"] = str(channel["_id"])
-            
-            return channels
-            
-        except PyMongoError as e:
-            logger.error(f"Error getting user channels: {e}")
-            return []
-    
-    async def get_channel_by_username(self, username: str) -> Optional[Dict]:
-        """Obtiene un canal por su nombre de usuario."""
-        try:
-            channel = self.approved_channels.find_one({"channel_username": username})
-            if channel:
-                channel["_id"] = str(channel["_id"])
-            return channel
-            
-        except PyMongoError as e:
-            logger.error(f"Error getting channel by username: {e}")
-            return None
-    
-    async def get_channel_by_id(self, channel_id: str) -> Optional[Dict]:
-        """Obtiene un canal por su ID."""
-        try:
-            from bson import ObjectId
-            channel = self.approved_channels.find_one({"_id": ObjectId(channel_id)})
-            if channel:
-                channel["_id"] = str(channel["_id"])
-            return channel
-            
-        except PyMongoError as e:
-            logger.error(f"Error getting channel by ID: {e}")
-            return None
-    
-    async def delete_channel(self, channel_id: str) -> bool:
-        """Elimina un canal de la base de datos."""
-        try:
-            from bson import ObjectId
-            result = self.approved_channels.delete_one({"_id": ObjectId(channel_id)})
-            return result.deleted_count > 0
-            
-        except PyMongoError as e:
-            logger.error(f"Error deleting channel: {e}")
-            return False
-    
-    async def update_channel(self, channel_id: str, update_data: Dict) -> bool:
-        """Actualiza un canal en la base de datos."""
-        try:
-            from bson import ObjectId
-            update_data["last_updated"] = datetime.now()
-            result = self.approved_channels.update_one(
-                {"_id": ObjectId(channel_id)}, 
-                {"$set": update_data}
+            self.db.approved_channels.update_one(
+                {"channel_id": channel_id},
+                {
+                    "$set": {
+                        "channel_name": channel_name,
+                        "channel_username": channel_username,
+                        "category": category,
+                        "added_by": added_by,
+                        "added_date": datetime.now().isoformat(),
+                        "subscribers": 0
+                    }
+                },
+                upsert=True
             )
-            return result.modified_count > 0
-            
+            return True, self.db.approved_channels.count_documents({"category": category})
         except PyMongoError as e:
-            logger.error(f"Error updating channel: {e}")
-            return False
-    
-    async def save_pending_submission(self, submission_id: str, submission_data: Dict) -> bool:
-        """Guarda una solicitud pendiente."""
+            logger.error(f"Error guardando canal aprobado: {e}")
+            return False, 0
+
+    def get_approved_channels(self, category=None, user_id=None):
+        """Obtiene los canales aprobados, opcionalmente filtrados por categoría o usuario."""
         try:
-            submission_data["submission_id"] = submission_id
-            submission_data["submission_date"] = datetime.now()
+            query = {}
+            if category:
+                query["category"] = category
+            if user_id:
+                query["added_by"] = user_id
             
-            result = self.pending_submissions.insert_one(submission_data)
-            return result.inserted_id is not None
-            
+            return list(self.db.approved_channels.find(query))
         except PyMongoError as e:
-            logger.error(f"Error saving pending submission: {e}")
+            logger.error(f"Error obteniendo canales aprobados: {e}")
+            return []
+
+    def delete_approved_channel(self, channel_id):
+        """Elimina un canal aprobado de la base de datos."""
+        try:
+            result = self.db.approved_channels.delete_one({"channel_id": channel_id})
+            return result.deleted_count > 0
+        except PyMongoError as e:
+            logger.error(f"Error eliminando canal aprobado: {e}")
             return False
-    
-    async def delete_pending_submission(self, submission_id: str) -> bool:
+
+    # ----- FUNCIONES DE SOLICITUDES PENDIENTES -----
+    def save_pending_submission(self, submission_id, submission_data):
+        """Guarda una solicitud pendiente en la base de datos."""
+        try:
+            submission_data["submission_date"] = datetime.now().isoformat()
+            self.db.pending_submissions.update_one(
+                {"submission_id": submission_id},
+                {"$set": submission_data},
+                upsert=True
+            )
+            return True
+        except PyMongoError as e:
+            logger.error(f"Error guardando solicitud pendiente: {e}")
+            return False
+
+    def get_pending_submissions(self):
+        """Obtiene todas las solicitudes pendientes."""
+        try:
+            return {s["submission_id"]: s for s in self.db.pending_submissions.find({}, {'_id': 0})}
+        except PyMongoError as e:
+            logger.error(f"Error obteniendo solicitudes pendientes: {e}")
+            return {}
+
+    def delete_pending_submission(self, submission_id):
         """Elimina una solicitud pendiente."""
         try:
-            result = self.pending_submissions.delete_one({"submission_id": submission_id})
+            result = self.db.pending_submissions.delete_one({"submission_id": submission_id})
             return result.deleted_count > 0
-            
         except PyMongoError as e:
-            logger.error(f"Error deleting pending submission: {e}")
+            logger.error(f"Error eliminando solicitud pendiente: {e}")
             return False
-    
-    async def update_user_stats(self, user_id: int, chat_id: int, stat_type: str) -> bool:
+
+    # ----- FUNCIONES DE ESTADÍSTICAS -----
+    def update_user_stats(self, user_id, chat_id, stat_type):
         """Actualiza las estadísticas de un usuario."""
         try:
-            now = datetime.now()
-            
-            self.user_stats.update_one(
+            self.db.stats.update_one(
                 {"user_id": user_id, "chat_id": chat_id},
                 {
                     "$inc": {stat_type: 1},
-                    "$set": {"last_active": now}
+                    "$set": {"last_active": datetime.now().isoformat()}
                 },
                 upsert=True
             )
             return True
-            
         except PyMongoError as e:
-            logger.error(f"Error updating user stats: {e}")
+            logger.error(f"Error actualizando estadísticas: {e}")
             return False
-    
-    async def get_user_stats(self, user_id: int, chat_id: int) -> Dict:
+
+    def get_user_stats(self, user_id, chat_id):
         """Obtiene las estadísticas de un usuario."""
         try:
-            stats = self.user_stats.find_one({"user_id": user_id, "chat_id": chat_id})
-            
-            if stats:
-                return {
-                    "messages": stats.get("messages", 0),
-                    "media": stats.get("media", 0),
-                    "commands": stats.get("commands", 0),
-                    "last_active": stats.get("last_active")
-                }
-            else:
-                return {
-                    "messages": 0,
-                    "media": 0,
-                    "commands": 0,
-                    "last_active": None
-                }
-                
+            stats = self.db.stats.find_one({"user_id": user_id, "chat_id": chat_id})
+            return {
+                "messages": stats.get("messages", 0),
+                "media": stats.get("media", 0),
+                "commands": stats.get("commands", 0),
+                "last_active": stats.get("last_active") if stats else None
+            }
         except PyMongoError as e:
-            logger.error(f"Error getting user stats: {e}")
+            logger.error(f"Error obteniendo estadísticas: {e}")
             return {"messages": 0, "media": 0, "commands": 0, "last_active": None}
-    
-    async def add_warning(self, user_id: int, chat_id: int, reason: str) -> int:
+
+    # ----- FUNCIONES DE ADVERTENCIAS -----
+    def add_warning(self, user_id, chat_id, reason):
         """Añade una advertencia a un usuario."""
         try:
-            warning_data = {
+            warning = {
                 "reason": reason,
-                "date": datetime.now()
+                "date": datetime.now().isoformat()
             }
             
-            result = self.warnings.update_one(
+            result = self.db.warnings.update_one(
                 {"user_id": user_id, "chat_id": chat_id},
                 {
                     "$inc": {"count": 1},
-                    "$push": {"reasons": warning_data}
+                    "$push": {"reasons": warning}
                 },
                 upsert=True
             )
             
-            # Obtener el conteo actual
-            warning_doc = self.warnings.find_one({"user_id": user_id, "chat_id": chat_id})
-            return warning_doc.get("count", 1) if warning_doc else 1
-            
+            if result.upserted_id:
+                return 1
+            else:
+                warnings = self.db.warnings.find_one({"user_id": user_id, "chat_id": chat_id})
+                return warnings.get("count", 1)
         except PyMongoError as e:
-            logger.error(f"Error adding warning: {e}")
+            logger.error(f"Error añadiendo advertencia: {e}")
             return 0
-    
-    async def get_warnings(self, user_id: int, chat_id: int) -> Dict:
+
+    def get_warnings(self, user_id, chat_id):
         """Obtiene las advertencias de un usuario."""
         try:
-            warnings = self.warnings.find_one({"user_id": user_id, "chat_id": chat_id})
-            
-            if warnings:
-                return {
-                    "count": warnings.get("count", 0),
-                    "reasons": warnings.get("reasons", [])
-                }
-            else:
-                return {"count": 0, "reasons": []}
-                
+            warnings = self.db.warnings.find_one({"user_id": user_id, "chat_id": chat_id})
+            return {
+                "count": warnings.get("count", 0),
+                "reasons": warnings.get("reasons", [])
+            } if warnings else {"count": 0, "reasons": []}
         except PyMongoError as e:
-            logger.error(f"Error getting warnings: {e}")
+            logger.error(f"Error obteniendo advertencias: {e}")
             return {"count": 0, "reasons": []}
-    
-    async def reset_warnings(self, user_id: int, chat_id: int) -> bool:
+
+    def reset_warnings(self, user_id, chat_id):
         """Reinicia las advertencias de un usuario."""
         try:
-            result = self.warnings.delete_one({"user_id": user_id, "chat_id": chat_id})
+            result = self.db.warnings.delete_one({"user_id": user_id, "chat_id": chat_id})
             return result.deleted_count > 0
-            
         except PyMongoError as e:
-            logger.error(f"Error resetting warnings: {e}")
+            logger.error(f"Error reiniciando advertencias: {e}")
             return False
+
+    # ----- NUEVAS FUNCIONES PARA CANALES DE USUARIO -----
+    def get_user_channels(self, user_id):
+        """Obtiene los canales y grupos de un usuario."""
+        try:
+            return list(self.db.user_channels.find({"owner_id": user_id}))
+        except PyMongoError as e:
+            logger.error(f"Error obteniendo canales del usuario: {e}")
+            return []
+
+    def save_user_channel(self, channel_data):
+        """Guarda un canal o grupo de usuario."""
+        try:
+            channel_data["added_date"] = datetime.now().isoformat()
+            self.db.user_channels.update_one(
+                {"channel_id": channel_data["channel_id"]},
+                {"$set": channel_data},
+                upsert=True
+            )
+            return True
+        except PyMongoError as e:
+            logger.error(f"Error guardando canal de usuario: {e}")
+            return False
+
+    def update_channel_name(self, channel_id, new_name):
+        """Actualiza el nombre de un canal."""
+        try:
+            result = self.db.user_channels.update_one(
+                {"channel_id": channel_id},
+                {"$set": {"title": new_name}}
+            )
+            return result.modified_count > 0
+        except PyMongoError as e:
+            logger.error(f"Error actualizando nombre del canal: {e}")
+            return False
+
+    def update_channel_link(self, channel_id, new_link):
+        """Actualiza el enlace de un canal."""
+        try:
+            result = self.db.user_channels.update_one(
+                {"channel_id": channel_id},
+                {"$set": {"link": new_link}}
+            )
+            return result.modified_count > 0
+        except PyMongoError as e:
+            logger.error(f"Error actualizando enlace del canal: {e}")
+            return False
+
+    def delete_user_channel(self, channel_id, user_id):
+        """Elimina un canal de usuario."""
+        try:
+            result = self.db.user_channels.delete_one({
+                "channel_id": channel_id,
+                "owner_id": user_id
+            })
+            return result.deleted_count > 0
+        except PyMongoError as e:
+            logger.error(f"Error eliminando canal de usuario: {e}")
+            return False
+
+    # ----- FUNCIONES PARA POSTS AUTOMÁTICOS -----
+    def save_post_config(self, post_id, config_data):
+        """Guarda la configuración de un post automático."""
+        try:
+            self.db.scheduled_posts.update_one(
+                {"post_id": post_id},
+                {"$set": config_data},
+                upsert=True
+            )
+            return True
+        except PyMongoError as e:
+            logger.error(f"Error guardando configuración del post: {e}")
+            return False
+
+    def get_post_config(self, post_id=None):
+        """Obtiene la configuración de posts automáticos."""
+        try:
+            if post_id:
+                return self.db.scheduled_posts.find_one({"post_id": post_id})
+            return list(self.db.scheduled_posts.find({}))
+        except PyMongoError as e:
+            logger.error(f"Error obteniendo configuración de posts: {e}")
+            return None if post_id else []
+
+    def update_post_stats(self, post_id, channel_id, status, message_id=None, deleted_at=None):
+        """Actualiza las estadísticas de un post."""
+        try:
+            update_data = {
+                "status": status,
+                "updated_at": datetime.now().isoformat()
+            }
+            if message_id:
+                update_data["message_id"] = message_id
+            if deleted_at:
+                update_data["deleted_at"] = deleted_at
+
+            self.db.post_stats.update_one(
+                {"post_id": post_id, "channel_id": channel_id},
+                {"$set": update_data},
+                upsert=True
+            )
+            return True
+        except PyMongoError as e:
+            logger.error(f"Error actualizando estadísticas del post: {e}")
+            return False
+
+    def count_channels_by_type(self, user_id):
+        """Cuenta los canales por tipo de un usuario."""
+        try:
+            pipeline = [
+                {"$match": {"owner_id": user_id}},
+                {"$group": {
+                    "_id": "$type",
+                    "count": {"$sum": 1},
+                    "total_members": {"$sum": "$members"}
+                }}
+            ]
+            results = list(self.db.user_channels.aggregate(pipeline))
+            counts = {"channels": 0, "groups": 0, "channel_members": 0, "group_members": 0}
+            for result in results:
+                if result["_id"] == "channel":
+                    counts["channels"] = result["count"]
+                    counts["channel_members"] = result["total_members"]
+                elif result["_id"] == "group":
+                    counts["groups"] = result["count"]
+                    counts["group_members"] = result["total_members"]
+            return counts
+        except PyMongoError as e:
+            logger.error(f"Error contando canales por tipo: {e}")
+            return {"channels": 0, "groups": 0, "channel_members": 0, "group_members": 0}
