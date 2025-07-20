@@ -173,6 +173,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Actualizar estadísticas
     if update.effective_user:
         await db.update_user_stats(update.effective_user.id, update.effective_chat.id, "commands")
+        
+# Add these functions to your bot.py file
+
+async def reject_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja el rechazo de una solicitud."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data.split("_")
+    request_id = data[2]
+    
+    if not pending_submissions.get(request_id):
+        await query.answer("Esta solicitud ya no está disponible", show_alert=True)
+        return
+    
+    # Obtener información de la solicitud
+    submission = pending_submissions[request_id]
+    
+    # Actualizar estado en la base de datos
+    db.update_submission_status(request_id, "rejected", user_id)
+    
+    # Notificar al usuario que su solicitud fue rechazada
+    try:
+        await context.bot.send_message(
+            chat_id=submission['user_id'],
+            text="❌ Tu solicitud ha sido rechazada.\nPuedes intentar nuevamente siguiendo las instrucciones correctamente."
+        )
+    except TelegramError:
+        logger.error(f"No se pudo notificar al usuario {submission['user_id']}")
+    
+    # Actualizar mensaje original
+    await query.edit_message_text(
+        f"❌ Solicitud rechazada por {query.from_user.first_name}",
+        reply_markup=None
+    )
+    
+    # Eliminar de pending_submissions
+    del pending_submissions[request_id]
+
+async def check_request_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verifica el estado de una solicitud."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data.split("_")
+    request_id = data[2]
+    
+    # Obtener estado de la solicitud de la base de datos
+    status = db.get_submission_status(request_id)
+    
+    if not status:
+        await query.answer("No se encontró la solicitud", show_alert=True)
+        return
+    
+    status_messages = {
+        "pending": "📊 Tu solicitud está pendiente de revisión.",
+        "approved": "✅ Tu solicitud ha sido aprobada.",
+        "rejected": "❌ Tu solicitud ha sido rechazada.",
+    }
+    
+    await query.answer(status_messages.get(status, "Estado desconocido"), show_alert=True)        
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Da la bienvenida a nuevos miembros del grupo."""
@@ -213,89 +272,136 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def miscanales_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Comando MisCanales para usuarios."""
-    await show_my_channels(update, context, is_callback=False)
+    await show_user_channels(update, context, is_callback=False)
 
-async def show_my_channels(update, context, is_callback=True):
-    """Muestra los canales del usuario."""
-    user_id = update.effective_user.id
+# Add these functions to your bot.py file
+
+async def show_user_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra los canales y grupos añadidos por el usuario."""
+    query = update.callback_query or update.message
+    user_id = query.from_user.id
     
-    # Obtener canales del usuario
-    user_channels = await db.get_user_channels(user_id)
+    # Obtener canales y grupos del usuario
+    channels = db.get_user_channels(user_id)
     
-    if not user_channels:
-        text = ("📣 Canales y Grupos 👥\n\n"
-               "☁️ Gestiona los canales o grupos que has añadido a las Categorías\n\n"
-               "📣 Canales: 0\n"
-               "👥 Grupos: 0\n\n"
-               "No has añadido ningún canal aún.")
+    if not channels:
+        message = "📣 Canales y Grupos 👥\n\n❌ No has añadido ningún canal o grupo todavía."
+        keyboard = [[InlineKeyboardButton("➕ Añadir Canal/Grupo", callback_data="add_channel")]]
         
-        keyboard = [[InlineKeyboardButton("➕ Añadir Canal", callback_data="add_channel_help")]]
-        if is_callback:
-            keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_main")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        if is_callback:
-            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        if isinstance(query, telegram.CallbackQuery):
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await update.message.reply_text(text, reply_markup=reply_markup)
+            await query.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
         return
     
-    # Separar canales y grupos
-    channels = [ch for ch in user_channels if not ch['channel_username'].startswith('g_')]
-    groups = [ch for ch in user_channels if ch['channel_username'].startswith('g_')]
+    # Contar canales y grupos
+    channel_count = sum(1 for c in channels if c['type'] == 'channel')
+    group_count = sum(1 for c in channels if c['type'] == 'group')
     
-    # Obtener número de suscriptores
-    total_channel_subs = 0
-    total_group_subs = 0
+    # Calcular total de suscriptores
+    channel_subs = sum(c['members'] for c in channels if c['type'] == 'channel')
+    group_subs = sum(c['members'] for c in channels if c['type'] == 'group')
     
-    text = ("📣 Canales y Grupos 👥\n\n"
-           "☁️ Gestiona los canales o grupos que has añadido a las Categorías\n\n")
+    message = (
+        "📣 Canales y Grupos 👥\n\n"
+        "☁️ Gestiona los canales o grupos que has añadido a las Categorías\n\n"
+        f"📣 Canales: {channel_count}\n"
+        f"    ┗👤{channel_subs}\n"
+        f"👥 Grupos: {group_count}\n"
+        f"    ┗👤{group_subs}\n\n"
+    )
     
-    # Calcular suscriptores totales
-    for channel in channels:
-        member_count = await get_channel_member_count(context, channel['channel_username'])
-        total_channel_subs += member_count
-    
-    for group in groups:
-        member_count = await get_channel_member_count(context, group['channel_username'].replace('g_', ''))
-        total_group_subs += member_count
-    
-    text += f"📣 Canales: {len(channels)}\n"
-    text += f"    ┗👤{total_channel_subs}\n"
-    text += f"👥 Grupos: {len(groups)}\n"
-    text += f"    ┗👤{total_group_subs}\n\n"
-    
-    # Listar todos los canales
-    all_channels = channels + groups
+    # Añadir lista de canales y grupos
     keyboard = []
-    
-    for i, channel in enumerate(all_channels, 1):
-        is_group = channel['channel_username'].startswith('g_')
-        username = channel['channel_username'].replace('g_', '') if is_group else channel['channel_username']
-        member_count = await get_channel_member_count(context, username)
-        
-        icon = "👥" if is_group else "📣"
-        text += f"{i}. {icon}  {channel['channel_name']}\n"
-        text += f"      ┗👤{member_count}\n"
-        
+    for i, channel in enumerate(channels, 1):
+        message += (
+            f"{i}. {'📣' if channel['type'] == 'channel' else '👥'} {channel['title']}\n"
+            f"      ┗👤{channel['members']}\n"
+        )
         # Crear botones para cada canal
         row = [
-            InlineKeyboardButton(f"#{i}", url=f"https://t.me/{username}"),
-            InlineKeyboardButton("📝", callback_data=f"edit_channel_{channel['_id']}"),
-            InlineKeyboardButton("🗑️", callback_data=f"delete_channel_{channel['_id']}")
+            InlineKeyboardButton(f"#{i}", url=channel['link']),
+            InlineKeyboardButton("📝", callback_data=f"edit_channel_{channel['id']}"),
+            InlineKeyboardButton("🗑️", callback_data=f"delete_channel_{channel['id']}")
         ]
         keyboard.append(row)
     
-    if is_callback:
-        keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data="back_to_main")])
+    # Añadir botón para añadir nuevo canal
+    keyboard.append([InlineKeyboardButton("➕ Añadir Canal/Grupo", callback_data="add_channel")])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if is_callback:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    if isinstance(query, telegram.CallbackQuery):
+        await query.edit_message_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
     else:
-        await update.message.reply_text(text, reply_markup=reply_markup)
+        await query.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+
+async def edit_channel_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja la edición de información de un canal."""
+    query = update.callback_query
+    channel_id = query.data.split("_")[2]
+    
+    channel = db.get_channel(channel_id)
+    if not channel:
+        await query.answer("Canal no encontrado", show_alert=True)
+        return
+    
+    message = (
+        "✏️ Editar\n\n"
+        f"🏷 {channel['title']}\n"
+        f"🆔 {channel['id']}\n"
+        f"🔗 {channel['link']}\n"
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Cambiar Nombre", callback_data=f"change_name_{channel_id}"),
+            InlineKeyboardButton("📝 Modificar Enlace", callback_data=f"change_link_{channel_id}")
+        ],
+        [InlineKeyboardButton("Volver 🔙", callback_data="show_channels")]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
+async def change_channel_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja el cambio de nombre de un canal."""
+    query = update.callback_query
+    channel_id = query.data.split("_")[2]
+    
+    context.user_data['editing_channel'] = channel_id
+    context.user_data['edit_type'] = 'name'
+    
+    keyboard = [[InlineKeyboardButton("Volver 🔙", callback_data=f"edit_channel_{channel_id}")]]
+    
+    await query.edit_message_text(
+        "📌 Envíe un nombre personalizado para el canal",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def change_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja el cambio de enlace de un canal."""
+    query = update.callback_query
+    channel_id = query.data.split("_")[2]
+    
+    context.user_data['editing_channel'] = channel_id
+    context.user_data['edit_type'] = 'link'
+    
+    keyboard = [[InlineKeyboardButton("Volver 🔙", callback_data=f"edit_channel_{channel_id}")]]
+    
+    await query.edit_message_text(
+        "📌 Envíe el nuevo enlace para el canal",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def process_channel_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Procesa solicitudes de canales."""
@@ -955,6 +1061,15 @@ def main() -> None:
     application.add_handler(CommandHandler("E", e_command))
     application.add_handler(CommandHandler("List", list_command))
     application.add_handler(CommandHandler("V", v_command))
+    application.add_handler(CommandHandler("miscanales", show_user_channels))
+    application.add_handler(CallbackQueryHandler(show_user_channels, pattern="^show_channels$"))
+    application.add_handler(CallbackQueryHandler(edit_channel_info, pattern="^edit_channel_"))
+    application.add_handler(CallbackQueryHandler(change_channel_name, pattern="^change_name_"))
+    application.add_handler(CallbackQueryHandler(change_channel_link, pattern="^change_link_"))
+    
+    # Manejadores para solicitudes
+    application.add_handler(CallbackQueryHandler(reject_request, pattern="^reject_request_"))
+    application.add_handler(CallbackQueryHandler(check_request_status, pattern="^check_status_"))
     
     # Otros manejadores
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
